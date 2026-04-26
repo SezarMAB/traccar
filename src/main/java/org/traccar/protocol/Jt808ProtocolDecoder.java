@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 - 2024 Anton Tananaev (anton@traccar.org)
+ * Copyright 2015 - 2026 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import org.traccar.Protocol;
 import org.traccar.helper.BcdUtil;
 import org.traccar.helper.BitUtil;
 import org.traccar.helper.Checksum;
+import org.traccar.helper.DataConverter;
 import org.traccar.helper.DateBuilder;
 import org.traccar.helper.UnitsConverter;
 import org.traccar.model.CellTower;
@@ -46,9 +47,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.TimeZone;
 
-public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
+public class Jt808ProtocolDecoder extends BaseProtocolDecoder {
 
-    public HuabaoProtocolDecoder(Protocol protocol) {
+    public Jt808ProtocolDecoder(Protocol protocol) {
         super(protocol);
     }
 
@@ -56,6 +57,7 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
     public static final int MSG_GENERAL_RESPONSE = 0x8001;
     public static final int MSG_GENERAL_RESPONSE_2 = 0x4401;
     public static final int MSG_HEARTBEAT = 0x0002;
+    public static final int MSG_TERMINAL_LOGOUT = 0x0003;
     public static final int MSG_HEARTBEAT_2 = 0x0506;
     public static final int MSG_TERMINAL_REGISTER = 0x0100;
     public static final int MSG_TERMINAL_REGISTER_RESPONSE = 0x8100;
@@ -78,6 +80,8 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
     public static final int MSG_CONFIGURATION_PARAMETERS = 0x8103;
     public static final int MSG_COMMAND_RESPONSE = 0x0701;
     public static final int MSG_DRIVER_IDENTITY = 0x0702;
+    public static final int MSG_VIDEO_REQUEST = 0x9101;
+    public static final int MSG_VIDEO_CONTROL = 0x9102;
 
     public static final int RESULT_SUCCESS = 0;
 
@@ -196,7 +200,7 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
         return dateBuilder.getDate();
     }
 
-    private String decodeId(ByteBuf id) {
+    static String decodeId(ByteBuf id) {
         String serial = ByteBufUtil.hexDump(id);
         if (serial.matches("[0-9]+")) {
             return serial;
@@ -204,6 +208,18 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
             long imei = id.getUnsignedShort(0);
             imei = (imei << 32) + id.getUnsignedInt(2);
             return String.valueOf(imei) + Checksum.luhn(imei);
+        }
+    }
+
+    static ByteBuf encodeId(String uniqueId) {
+        if (uniqueId.length() % 2 == 0) {
+            return Unpooled.wrappedBuffer(DataConverter.parseHex(uniqueId));
+        } else {
+            long imei = Long.parseLong(uniqueId.substring(0, uniqueId.length() - 1));
+            ByteBuf buf = Unpooled.buffer(6);
+            buf.writeShort((int) (imei >> 32));
+            buf.writeInt((int) imei);
+            return buf;
         }
     }
 
@@ -335,7 +351,8 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
                 return position;
             }
 
-        } else if (type == MSG_TERMINAL_AUTH || type == MSG_HEARTBEAT_2 || type == MSG_PHOTO) {
+        } else if (type == MSG_TERMINAL_AUTH || type == MSG_HEARTBEAT_2
+                || type == MSG_PHOTO || type == MSG_TERMINAL_LOGOUT) {
 
             sendGeneralResponse(channel, remoteAddress, id, type, index);
 
@@ -575,6 +592,7 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
             int endIndex = buf.readerIndex() + length;
             String stringValue;
             int event;
+            long alarm;
             switch (subtype) {
                 case 0x01:
                     position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 100);
@@ -648,14 +666,14 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
                     buf.readUnsignedByte(); // reserved
                     break;
                 case 0x57:
-                    int alarm = buf.readUnsignedShort();
+                    alarm = buf.readUnsignedShort();
                     position.addAlarm(BitUtil.check(alarm, 8) ? Position.ALARM_ACCELERATION : null);
                     position.addAlarm(BitUtil.check(alarm, 9) ? Position.ALARM_BRAKING : null);
                     position.addAlarm(BitUtil.check(alarm, 10) ? Position.ALARM_CORNERING : null);
                     buf.readUnsignedShort(); // external switch state
-                    long alarm2 = buf.readUnsignedInt();
+                    alarm = buf.readUnsignedInt();
                     if ("MV810G".equals(model) || "MV710G".equals(model)) {
-                        position.addAlarm(BitUtil.check(alarm2, 16) ? Position.ALARM_DOOR : null);
+                        position.addAlarm(BitUtil.check(alarm, 16) ? Position.ALARM_DOOR : null);
                     }
                     break;
                 case 0x60:
@@ -893,6 +911,15 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
                                 case 0x002D:
                                     position.set(Position.KEY_BATTERY, buf.readUnsignedShort() / 1000.0);
                                     break;
+                                case 0x0089:
+                                    alarm = buf.readUnsignedInt();
+                                    if (!BitUtil.check(alarm, 0)) {
+                                        position.addAlarm(Position.ALARM_POWER_OFF);
+                                    }
+                                    if (!BitUtil.check(alarm, 12)) {
+                                        position.addAlarm(Position.ALARM_REMOVING);
+                                    }
+                                    break;
                                 case 0x00B2:
                                     position.set(Position.KEY_ICCID, ByteBufUtil.hexDump(
                                             buf.readSlice(10)).replaceAll("f", ""));
@@ -904,6 +931,18 @@ public class HuabaoProtocolDecoder extends BaseProtocolDecoder {
                                     for (int i = 0; i < wifi.length / 2; i++) {
                                         network.addWifiAccessPoint(
                                                 WifiAccessPoint.from(wifi[i * 2], Integer.parseInt(wifi[i * 2 + 1])));
+                                    }
+                                    break;
+                                case 0x00C5:
+                                    alarm = buf.readUnsignedInt();
+                                    if (!BitUtil.check(alarm, 6)) {
+                                        position.addAlarm(Position.ALARM_VIBRATION);
+                                    }
+                                    long motionState = BitUtil.between(alarm, 23, 25);
+                                    if (motionState == 0) {
+                                        position.set(Position.KEY_MOTION, true);
+                                    } else if (motionState == 1) {
+                                        position.set(Position.KEY_MOTION, false);
                                     }
                                     break;
                                 case 0x00C6:
